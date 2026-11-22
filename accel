@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# accel - run any command through the Clash/mihomo proxy temporarily
+#
+# Location: ~/.local/bin/accel
+# Docs: ~/.config/mihomo/README.md
+set -uo pipefail
+
+PROXY_HOST="${ACCEL_HOST:-127.0.0.1}"
+PROXY_PORT="${ACCEL_PORT:-7899}"
+CTRL_PORT="${ACCEL_CTRL_PORT:-9090}"
+PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
+CTRL_URL="http://${PROXY_HOST}:${CTRL_PORT}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+NO_PROXY_LIST="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,.local,.lan,.ts.net,.tailscale.com"
+
+usage() {
+cat <<'EOF'
+accel - run a command through the Clash/mihomo proxy
+
+Usage:
+  accel <command> [args...]     Run the command with proxy variables
+  accel -- <command> [...]      Same (for command names like status)
+  accel status                  Show proxy status, current node, exit IP
+  accel test                    Test proxy connectivity
+  accel restart                 Restart the mihomo service
+  accel help                    Show this help
+
+Examples:
+  accel git clone https://github.com/owner/repo.git
+  accel npx skills add owner/repo --list
+  accel pip install -r requirements.txt
+  accel curl -I https://github.com
+
+Notes:
+  - Sets http_proxy/https_proxy/all_proxy for this command only
+  - Tries to start the service if it is not running (TUN requires sudo)
+  - Exits with the same status code as the command
+  - Docs: ~/.config/mihomo/README.md
+EOF
+}
+
+mode() {
+    if systemctl is-active --quiet mihomo-tun 2>/dev/null; then
+        echo tun
+    elif systemctl --user is-active --quiet mihomo 2>/dev/null; then
+        echo http
+    elif systemctl is-enabled --quiet mihomo-tun 2>/dev/null; then
+        echo tun-off
+    else
+        echo none
+    fi
+}
+
+mode_label() {
+    case "$1" in
+        tun)     echo "TUN global mode (running)" ;;
+        http)    echo "HTTP proxy mode (running)" ;;
+        tun-off) echo "TUN installed but not running" ;;
+        *)       echo "not running" ;;
+    esac
+}
+
+ensure_service() {
+    local m i
+    m=$(mode)
+    case "$m" in
+        tun|http) return 0 ;;
+        tun-off)
+            if [ -t 0 ]; then
+                echo "Starting TUN service (requires sudo)..." >&2
+                sudo systemctl start mihomo-tun || return 1
+            else
+                echo "TUN service is not running. Run: sudo systemctl start mihomo-tun" >&2
+                return 1
+            fi
+            ;;
+        none)
+            systemctl --user start mihomo 2>/dev/null || return 1
+            ;;
+    esac
+    for i in 1 2 3 4 5 6; do
+        sleep 0.5
+        [ "$(mode)" != "none" ] && return 0
+    done
+    return 1
+}
+
+proxy_code() {
+    curl -sS --noproxy '' -x "$PROXY_URL" -o /dev/null \
+        --connect-timeout 5 --max-time 12 -w '%{http_code} %{time_total}' \
+        https://www.gstatic.com/generate_204 2>/dev/null
+}
+
+check_proxy() {
+    local out code
+    out=$(proxy_code)
+    code=${out%% *}
+    [ "$code" = "204" ] || [ "$code" = "200" ]
+}
+
+node_lines() {
+    curl -s --noproxy '*' -m 3 "$CTRL_URL/proxies" 2>/dev/null | /usr/bin/python3 -c '
+import sys, json
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+proxies = data.get("proxies") or {}
+for name, item in proxies.items():
+    if name != "GLOBAL" and item.get("type") == "Selector":
+        print("  %s -> %s" % (name, item.get("now", "-")))
+' 2>/dev/null | head -4
+}
+
+show_status() {
+    local m out code elapsed nodes trace ip loc
+    m=$(mode)
+    echo "======================================================"
+    echo "  Clash Accelerator Status"
+    echo "======================================================"
+    printf 'Mode       : %s\n' "$(mode_label "$m")"
+    printf 'Proxy      : %s\n' "$PROXY_URL"
+    printf 'Controller : %s/ui/\n' "$CTRL_URL"
+    if [ "$m" = "none" ]; then
+        echo "Hint       : service is not running; run accel restart or clash start"
+        echo "======================================================"
+        return
+    fi
+    out=$(proxy_code)
+    code=${out%% *}
+    elapsed=${out#* }
+    if [ "$code" = "204" ] || [ "$code" = "200" ]; then
+        printf 'Connectivity: HTTP %s  (%ss)\n' "$code" "$elapsed"
+    else
+        printf 'Connectivity: failed (HTTP %s)\n' "${code:-000}"
+    fi
+    nodes=$(node_lines)
+    if [ -n "$nodes" ]; then
+        echo "Current node:"
+        echo "$nodes"
+    fi
+    trace=$(curl -sS --noproxy '' -x "$PROXY_URL" --max-time 15 \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)
+    if [ -n "$trace" ]; then
+        ip=$(printf '%s\n' "$trace" | sed -n 's/^ip=//p' | head -1)
+        loc=$(printf '%s\n' "$trace" | sed -n 's/^loc=//p' | head -1)
+        [ -n "$ip" ] && printf 'Exit IP    : %s\n' "$ip"
+        [ -n "$loc" ] && printf 'Location   : %s\n' "$loc"
+    fi
+    echo "======================================================"
+}
+
+run_cmd() {
+    if [ "$#" -lt 1 ]; then
+        usage
+        exit 2
+    fi
+    if ! ensure_service; then
+        echo "Error: mihomo service is not running; cannot apply the proxy" >&2
+        echo "       Run: clash start   or   accel restart" >&2
+        exit 1
+    fi
+    if ! check_proxy; then
+        sleep 2
+        if ! check_proxy; then
+            echo "Error: proxy port $PROXY_URL is not responding" >&2
+            echo "       Run accel status, or check logs with clash logs" >&2
+            exit 1
+        fi
+    fi
+    export http_proxy="$PROXY_URL" https_proxy="$PROXY_URL"
+    export HTTP_PROXY="$PROXY_URL" HTTPS_PROXY="$PROXY_URL"
+    export all_proxy="socks5h://${PROXY_HOST}:${PROXY_PORT}"
+    export ALL_PROXY="$all_proxy"
+    export no_proxy="$NO_PROXY_LIST" NO_PROXY="$NO_PROXY_LIST"
+    export npm_config_proxy="$PROXY_URL" npm_config_https_proxy="$PROXY_URL"
+    if [ "${1:-}" = "sudo" ]; then
+        echo "Note: sudo may clear proxy variables; use sudo -E or configure apt separately" >&2
+    fi
+    exec "$@"
+}
+
+case "${1:-}" in
+    ""|help|-h|--help)
+        usage
+        if [ -z "${1:-}" ]; then
+            echo
+            show_status
+        fi
+        exit 0
+        ;;
+    status|--status|test|--test)
+        show_status
+        exit 0
+        ;;
+    restart|--restart)
+        if command -v clash >/dev/null 2>&1; then
+            exec clash restart
+        fi
+        systemctl --user restart mihomo && echo "HTTP proxy restarted"
+        exit $?
+        ;;
+    --)
+        shift
+        run_cmd "$@"
+        ;;
+    *)
+        run_cmd "$@"
+        ;;
+esac

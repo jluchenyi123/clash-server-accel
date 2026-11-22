@@ -1,0 +1,36 @@
+# Local environment / secrets (never commit)
+claude.sh
+.env
+.env.*
+*.key
+*.pem
+
+# Runtime configuration and credentials (do not commit)
+config.yaml
+config-tun.yaml
+config.yaml.bak
+config-tun.yaml.bak
+subscriptions.json
+profiles/
+providers/
+tun-state.env
+rollback-tun.sh
+cache.db
+ui/
+
+# GeoIP / data files
+*.mmdb
+*.dat
+*.metadb
+
+# Logs and caches
+*.log
+__pycache__/
+*.pyc
+
+# Generated desktop file
+clash-accelerator.desktop
+
+# OS files
+.DS_Store
+Thumbs.db

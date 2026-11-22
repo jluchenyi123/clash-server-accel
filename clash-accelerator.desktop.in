@@ -1,0 +1,17 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Clash Accelerator
+Comment=Open Clash subscription manager and proxy status
+Exec=@HOME@/.local/bin/clash menu
+Path=@HOME@
+Icon=network-vpn
+Terminal=true
+StartupNotify=true
+Categories=Network;
+Keywords=clash;proxy;vpn;accel;
+Actions=status;
+
+[Desktop Action status]
+Name=Show Proxy Status
+Exec=/usr/bin/x-terminal-emulator -e @HOME@/.local/bin/clash-status

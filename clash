@@ -1,0 +1,1064 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+"""
+clash - Clash (mihomo) subscription manager for headless servers
+
+Usage:
+  clash                         Interactive menu
+  clash add <url>               Add a subscription and enable it
+  clash list                    List profiles/subscriptions
+  clash use <name>              Switch to a profile
+  clash update [name]           Update a subscription (default: active)
+  clash nodes [--test]          Show nodes, latency and select a node
+  clash status                  Show service and connectivity status
+  clash start|stop|restart      Manage the proxy service
+  clash logs [-f]               Show logs
+  clash tun on|off|status       System-wide TUN mode (requires sudo)
+  clash import-verge            Import subscriptions from Clash Verge
+"""
+
+import argparse
+import base64
+import copy
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+try:
+    import yaml
+except ImportError:
+    sys.stderr.write("PyYAML is missing. Install it with: sudo apt install python3-yaml\n")
+    sys.exit(1)
+
+HOME = os.path.expanduser("~")
+BASE = os.environ.get("CLASH_HOME") or os.path.join(HOME, ".config", "mihomo")
+PROFILES_DIR = os.path.join(BASE, "profiles")
+RUNTIME_HTTP = os.path.join(BASE, "config.yaml")
+RUNTIME_TUN = os.path.join(BASE, "config-tun.yaml")
+META_PATH = os.path.join(BASE, "subscriptions.json")
+UI_DIR = os.path.join(BASE, "ui")
+MIHOMO = os.environ.get("MIHOMO_BIN") or shutil.which("mihomo") or "/usr/local/bin/mihomo"
+MIXED_PORT = 7899
+CTRL_PORT = 9090
+PROXY_URL = "http://127.0.0.1:%d" % MIXED_PORT
+CONTROLLER = "http://127.0.0.1:%d" % CTRL_PORT
+UA_LIST = ("clash-verge/v2.5.10", "mihomo/1.19.13")
+GEO_FILES = ("Country.mmdb", "geoip.dat", "geosite.dat")
+OPTIONAL_GEO = ("ASN.mmdb",)
+TUN_UNIT = "/etc/systemd/system/mihomo-tun.service"
+VERGE_DATA = os.path.join(HOME, ".local/share/io.github.clash-verge-rev.clash-verge-rev")
+VERGE_PROFILES = os.path.join(VERGE_DATA, "profiles.yaml")
+
+TUN_EXCLUDE = [
+    "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "100.64.0.0/10",
+    "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4",
+    "fe80::/10", "fc00::/7", "fd7a:115c:a1e0::/48",
+]
+TUN_RULES = [
+    "PROCESS-NAME,tailscaled,DIRECT",
+    "PROCESS-NAME,tailscale,DIRECT",
+    "IP-CIDR,192.168.0.0/16,DIRECT,no-resolve",
+    "IP-CIDR,10.0.0.0/8,DIRECT,no-resolve",
+    "IP-CIDR,172.16.0.0/12,DIRECT,no-resolve",
+    "IP-CIDR,100.64.0.0/10,DIRECT,no-resolve",
+    "IP-CIDR,127.0.0.0/8,DIRECT,no-resolve",
+    "IP-CIDR,169.254.0.0/16,DIRECT,no-resolve",
+    "IP-CIDR6,fc00::/7,DIRECT,no-resolve",
+    "IP-CIDR6,fe80::/10,DIRECT,no-resolve",
+    "DOMAIN-SUFFIX,tailscale.com,DIRECT",
+    "DOMAIN-SUFFIX,tailscale.io,DIRECT",
+    "DOMAIN-SUFFIX,ts.net,DIRECT",
+    "DOMAIN-SUFFIX,lan,DIRECT",
+    "DOMAIN-SUFFIX,local,DIRECT",
+]
+
+
+# ---------------------------------------------------------------- Utilities
+def now_iso():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+def die(msg, code=1):
+    print("Error: %s" % msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def warn(msg):
+    print("Note: %s" % msg)
+
+
+def mask_url(url):
+    if not url:
+        return "-"
+    try:
+        u = urllib.parse.urlsplit(url)
+        return "%s://%s/…" % (u.scheme, u.hostname or "")
+    except Exception:
+        return "subscription URL"
+
+
+def clean_env():
+    env = os.environ.copy()
+    for key in list(env):
+        if key.lower() in ("http_proxy", "https_proxy", "all_proxy", "no_proxy"):
+            env.pop(key, None)
+    return env
+
+
+def user_env():
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", "/run/user/%d" % os.getuid())
+    return env
+
+
+def user_systemctl(*args):
+    return subprocess.run(
+        ["systemctl", "--user"] + list(args),
+        env=user_env(), text=True, capture_output=True,
+    )
+
+
+def system_systemctl(*args):
+    return subprocess.run(
+        ["systemctl"] + list(args), text=True, capture_output=True,
+    )
+
+
+def unit_active(name, user=True):
+    fn = user_systemctl if user else system_systemctl
+    return fn("is-active", name).stdout.strip() == "active"
+
+
+def tun_installed():
+    return os.path.exists(TUN_UNIT)
+
+
+def tun_active():
+    return unit_active("mihomo-tun", user=False)
+
+
+def tun_enabled():
+    return system_systemctl("is-enabled", "mihomo-tun").stdout.strip() == "enabled"
+
+
+def http_active():
+    return unit_active("mihomo")
+
+
+# ---------------------------------------------------------------- Metadata
+def load_meta():
+    if os.path.exists(META_PATH):
+        try:
+            with open(META_PATH, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            if isinstance(data, dict) and isinstance(data.get("profiles"), dict):
+                return data
+        except Exception:
+            pass
+    return {"version": 1, "active": None, "profiles": {}}
+
+
+def save_meta(meta):
+    os.makedirs(BASE, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".meta-", suffix=".json", dir=BASE)
+    with os.fdopen(fd, "w", encoding="utf-8") as fp:
+        json.dump(meta, fp, ensure_ascii=False, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, META_PATH)
+
+
+def ensure_geo():
+    os.makedirs(BASE, exist_ok=True)
+    missing = [f for f in GEO_FILES if not os.path.exists(os.path.join(BASE, f))]
+    sources = (VERGE_DATA, os.path.join(HOME, "clash"))
+    for fname in OPTIONAL_GEO:
+        if not os.path.exists(os.path.join(BASE, fname)):
+            for src in sources:
+                candidate = os.path.join(src, fname)
+                if os.path.exists(candidate):
+                    shutil.copy2(candidate, os.path.join(BASE, fname))
+                    break
+    if not missing:
+        return
+    for fname in missing:
+        for src in sources:
+            candidate = os.path.join(src, fname)
+            if os.path.exists(candidate):
+                shutil.copy2(candidate, os.path.join(BASE, fname))
+                break
+        else:
+            die("Missing GeoIP data file %s. Copy the Clash Verge data directory to %s" % (fname, BASE))
+
+
+def ensure_ui():
+    index = os.path.join(UI_DIR, "index.html")
+    if os.path.exists(index):
+        return
+    for src in (os.path.join(HOME, "clash", "dashboard"), os.path.join(VERGE_DATA, "ui")):
+        if os.path.exists(os.path.join(src, "index.html")):
+            shutil.copytree(src, UI_DIR, dirs_exist_ok=True)
+            return
+
+
+def ensure_base():
+    os.makedirs(PROFILES_DIR, exist_ok=True)
+    ensure_geo()
+    ensure_ui()
+    meta = load_meta()
+    if not meta["profiles"] and os.path.exists(RUNTIME_HTTP):
+        dest = os.path.join(PROFILES_DIR, "cy.yaml")
+        if not os.path.exists(dest):
+            shutil.copy2(RUNTIME_HTTP, dest)
+            os.chmod(dest, 0o600)
+        meta["profiles"]["cy"] = {
+            "name": "cy", "file": "profiles/cy.yaml", "url": None,
+            "type": "local", "updated": now_iso(),
+        }
+        meta["active"] = "cy"
+        save_meta(meta)
+    return meta
+
+
+def resolve_profile(meta, query):
+    if not query:
+        return meta.get("active")
+    if query in meta["profiles"]:
+        return query
+    exact = [s for s, p in meta["profiles"].items() if p.get("name") == query]
+    if len(exact) == 1:
+        return exact[0]
+    fuzzy = [s for s, p in meta["profiles"].items()
+             if query.lower() in s.lower() or query.lower() in str(p.get("name", "")).lower()]
+    if len(fuzzy) == 1:
+        return fuzzy[0]
+    return None
+
+
+# ---------------------------------------------------------------- Subscription download
+def read_text(path):
+    with open(path, "rb") as fp:
+        data = fp.read()
+    for enc in ("utf-8-sig", "utf-8", "gb18030"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def _maybe_base64(text):
+    s = re.sub(r"\s+", "", text)
+    if not s or len(s) % 4 or not re.fullmatch(r"[A-Za-z0-9+/=]+", s):
+        return None
+    try:
+        return base64.b64decode(s).decode("utf-8")
+    except Exception:
+        return None
+
+
+def parse_clash_yaml(path):
+    text = read_text(path)
+    candidates = [text]
+    b64 = _maybe_base64(text)
+    if b64:
+        candidates.append(b64)
+    for candidate in candidates:
+        try:
+            obj = yaml.safe_load(candidate)
+        except yaml.YAMLError:
+            continue
+        if isinstance(obj, dict) and any(k in obj for k in ("proxies", "proxy-providers", "proxy-groups")):
+            return obj
+    return None
+
+
+def download_subscription(url):
+    """Return (config, temp_file, method) or (None, None, error)."""
+    if not re.match(r"^https?://", url):
+        url = "https://" + url
+    fd, tmp = tempfile.mkstemp(prefix=".sub-", suffix=".yaml", dir=BASE)
+    os.close(fd)
+    attempts = [(ua, []) for ua in UA_LIST] + [(ua, ["--proxy", PROXY_URL]) for ua in UA_LIST]
+    errors = []
+    for ua, extra in attempts:
+        via = "via local proxy" if extra else "direct"
+        cmd = [
+            "curl", "-fsSL", "--compressed", "--connect-timeout", "15",
+            "--max-time", "60", "-A", ua, "-o", tmp, "-w", "%{http_code}",
+        ] + extra + [url]
+        try:
+            res = subprocess.run(cmd, text=True, capture_output=True, env=clean_env())
+        except Exception as exc:
+            errors.append("%s: %s" % (via, exc))
+            continue
+        code = (res.stdout or "").strip()
+        if res.returncode == 0 and code == "200" and os.path.getsize(tmp) > 0:
+            cfg = parse_clash_yaml(tmp)
+            if cfg is not None:
+                return cfg, tmp, via
+            errors.append("%s: response is not a Clash config" % via)
+        else:
+            errors.append("%s: HTTP %s" % (via, code or "failed"))
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    return None, None, "；".join(errors[-3:])
+
+
+# ---------------------------------------------------------------- Config generation
+def _ensure_groups_rules(cfg):
+    proxies = cfg.get("proxies") or []
+    if not proxies and not cfg.get("proxy-providers"):
+        raise ValueError("Subscription has no proxies or proxy-providers; cannot build a config")
+
+    if not cfg.get("proxy-groups") and proxies:
+        names = [p.get("name") for p in proxies if isinstance(p, dict) and p.get("name")]
+        cfg["proxy-groups"] = [
+            {"name": "Proxy", "type": "select", "proxies": ["Auto"] + names},
+            {"name": "Auto", "type": "url-test", "proxies": names,
+             "url": "http://www.gstatic.com/generate_204", "interval": 600},
+        ]
+
+    rules = cfg.get("rules")
+    if not isinstance(rules, list) or not rules:
+        groups = cfg.get("proxy-groups") or []
+        target = next((g.get("name") for g in groups if g.get("type") == "select"), None)
+        if not target and groups:
+            target = groups[0].get("name")
+        cfg["rules"] = ["GEOIP,CN,DIRECT", "MATCH,%s" % (target or "DIRECT")]
+
+
+def build_runtime(raw, mode="http"):
+    cfg = copy.deepcopy(raw)
+    for key in ("port", "socks-port", "redir-port", "tproxy-port", "mixed-port",
+                "external-controller", "external-controller-tls", "external-ui",
+                "secret", "authentication", "tun"):
+        cfg.pop(key, None)
+
+    cfg["mixed-port"] = MIXED_PORT
+    cfg["allow-lan"] = False
+    cfg["bind-address"] = "127.0.0.1"
+    cfg["mode"] = "rule"
+    cfg["log-level"] = "info"
+    cfg["external-controller"] = "127.0.0.1:%d" % CTRL_PORT
+    if os.path.exists(os.path.join(UI_DIR, "index.html")):
+        cfg["external-ui"] = "ui"
+    cfg["geodata-mode"] = True
+    cfg["geo-auto-update"] = False
+
+    profile = cfg.get("profile")
+    if not isinstance(profile, dict):
+        profile = {}
+    profile["store-selected"] = True
+    profile["store-fake-ip"] = True
+    cfg["profile"] = profile
+
+    dns = cfg.get("dns")
+    if not isinstance(dns, dict):
+        dns = {}
+    dns["enable"] = True
+    dns["listen"] = "127.0.0.1:53" if mode == "tun" else "127.0.0.1:1054"
+    dns.setdefault("ipv6", False)
+    dns.setdefault("enhanced-mode", "fake-ip")
+    dns.setdefault("fake-ip-range", "198.18.0.1/16")
+    dns.setdefault("use-hosts", True)
+    dns.setdefault("default-nameserver", ["223.5.5.5", "119.29.29.29"])
+    dns.setdefault("nameserver", [
+        "https://doh.pub/dns-query", "https://dns.alidns.com/dns-query",
+        "tls://dot.pub", "tls://dns.alidns.com",
+    ])
+    dns.setdefault("fallback", [
+        "https://doh.pub/dns-query", "https://dns.alidns.com/dns-query",
+        "tls://dot.pub", "tls://dns.alidns.com",
+    ])
+    dns.setdefault("fallback-filter", {"geoip": True, "ipcidr": ["240.0.0.0/4", "0.0.0.0/32"]})
+    dns.setdefault("proxy-server-nameserver", [
+        "https://doh.pub/dns-query", "https://dns.alidns.com/dns-query",
+    ])
+    filters = list(dns.get("fake-ip-filter") or [])
+    for item in ("*.lan", "*.local", "+.tailscale.com", "+.tailscale.io", "+.ts.net"):
+        if item not in filters:
+            filters.append(item)
+    dns["fake-ip-filter"] = filters
+    cfg["dns"] = dns
+
+    _ensure_groups_rules(cfg)
+
+    if mode == "tun":
+        cfg["tun"] = {
+            "enable": True,
+            "stack": "gvisor",
+            "auto-route": True,
+            "auto-detect-interface": True,
+            "strict-route": False,
+            "mtu": 1500,
+            "dns-hijack": ["any:53"],
+            "route-exclude-address": list(TUN_EXCLUDE),
+        }
+        rules = [r for r in (cfg.get("rules") or [])]
+        existing = set(rules)
+        cfg["rules"] = [r for r in TUN_RULES if r not in existing] + rules
+
+    return cfg
+
+
+def dump_config(cfg, path):
+    fd, tmp = tempfile.mkstemp(prefix=".cfg-", suffix=".yaml", dir=BASE)
+    with os.fdopen(fd, "w", encoding="utf-8") as fp:
+        yaml.safe_dump(cfg, fp, allow_unicode=True, sort_keys=False,
+                       default_flow_style=False, width=10 ** 9)
+    os.chmod(tmp, 0o600)
+    return tmp
+
+
+def validate_config(path):
+    try:
+        res = subprocess.run(
+            [MIHOMO, "-t", "-d", BASE, "-f", path],
+            text=True, capture_output=True, timeout=60, env=clean_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Config validation timed out"
+    output = ((res.stdout or "") + (res.stderr or "")).strip()
+    ok = res.returncode == 0 and "test is successful" in output
+    return ok, output
+
+
+def replace_config(tmp, path):
+    if os.path.exists(path):
+        try:
+            shutil.copy2(path, path + ".bak")
+        except OSError:
+            pass
+    os.replace(tmp, path)
+
+
+def rebuild_active(slug, restart=True):
+    meta = ensure_base()
+    profile = meta["profiles"].get(slug)
+    if not profile:
+        die("Profile not found: %s" % slug)
+    raw_path = os.path.join(BASE, profile["file"])
+    raw = parse_clash_yaml(raw_path)
+    if raw is None:
+        die("Cannot parse profile file: %s" % profile["file"])
+
+    try:
+        http_cfg = build_runtime(raw, "http")
+        tun_cfg = build_runtime(raw, "tun")
+    except ValueError as exc:
+        die(str(exc))
+
+    http_tmp = dump_config(http_cfg, RUNTIME_HTTP)
+    ok, log = validate_config(http_tmp)
+    if not ok:
+        os.unlink(http_tmp)
+        die("Generated HTTP config failed validation:\n%s" % log[-1500:])
+
+    tun_tmp = dump_config(tun_cfg, RUNTIME_TUN)
+    ok_tun, log_tun = validate_config(tun_tmp)
+    if not ok_tun:
+        os.unlink(tun_tmp)
+        os.unlink(http_tmp)
+        die("Generated TUN config failed validation:\n%s" % log_tun[-1500:])
+
+    replace_config(http_tmp, RUNTIME_HTTP)
+    if tun_tmp:
+        replace_config(tun_tmp, RUNTIME_TUN)
+
+    meta["active"] = slug
+    save_meta(meta)
+    if restart:
+        restart_proxy()
+        if not api_ready(8):
+            warn("Service started, but the controller is not reachable yet. Check logs with: clash logs")
+    print("Activated profile: %s" % profile.get("name", slug))
+
+
+def restart_proxy():
+    if os.environ.get("CLASH_NO_RESTART"):
+        print("Skipped service restart (CLASH_NO_RESTART=1)")
+        return
+    if tun_installed() and (tun_active() or tun_enabled()):
+        print("Restarting TUN service (requires sudo)...")
+        res = subprocess.run(["sudo", "systemctl", "restart", "mihomo-tun"])
+        if res.returncode != 0:
+            warn("Failed to restart TUN service. Run manually: sudo systemctl restart mihomo-tun")
+        return
+    user_systemctl("enable", "mihomo")
+    res = user_systemctl("restart", "mihomo")
+    if res.returncode != 0:
+        warn("Failed to restart HTTP proxy service. Check: systemctl --user status mihomo")
+
+
+# ---------------------------------------------------------------- REST API
+def api_request(path, method="GET", data=None, timeout=8):
+    url = CONTROLLER + path
+    body = json.dumps(data).encode("utf-8") if data is not None else None
+    req = urllib.request.Request(url, data=body, method=method,
+                                 headers={"Content-Type": "application/json"})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=timeout) as resp:
+        raw = resp.read()
+    if not raw:
+        return {}
+    return json.loads(raw.decode("utf-8"))
+
+
+def api_ready(timeout=8):
+    end = datetime.datetime.now().timestamp() + timeout
+    while datetime.datetime.now().timestamp() < end:
+        try:
+            api_request("/version", timeout=2)
+            return True
+        except Exception:
+            time.sleep(0.5)
+    return False
+
+
+def http_code(url, proxy=None, timeout=10):
+    if proxy:
+        handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    else:
+        handler = urllib.request.ProxyHandler({})
+    opener = urllib.request.build_opener(handler)
+    req = urllib.request.Request(url, headers={"User-Agent": "clash-cli"})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return str(resp.status)
+    except urllib.error.HTTPError as exc:
+        return str(exc.code)
+    except Exception:
+        return "failed"
+
+
+# ---------------------------------------------------------------- Commands
+def add_subscription(url, name=None, activate_it=True, overwrite=None, quiet=False, restart=True):
+    meta = ensure_base()
+    if not url:
+        url = input("Subscription URL: ").strip()
+    if not url:
+        die("Subscription URL is empty")
+    if not re.match(r"^https?://", url):
+        url = "https://" + url
+
+    host = urllib.parse.urlsplit(url).hostname or "subscription"
+    labels = host.split(".")
+    default = labels[-2] if len(labels) >= 2 else labels[0]
+    default = default or "subscription"
+    if not name:
+        if sys.stdin.isatty():
+            name = input("Profile name (Enter for %s): " % default).strip() or default
+        else:
+            name = default
+
+    slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", name.strip(), flags=re.UNICODE).strip("-").lower()
+    slug = slug or "subscription"
+
+    if slug in meta["profiles"]:
+        if overwrite is None:
+            if sys.stdin.isatty():
+                answer = input("Profile %s already exists. Overwrite? [y/N] " % name).strip().lower()
+                overwrite = answer == "y"
+            else:
+                overwrite = False
+        if not overwrite:
+            suffix = 2
+            while "%s-%d" % (slug, suffix) in meta["profiles"]:
+                suffix += 1
+            slug = "%s-%d" % (slug, suffix)
+
+    cfg, tmp, via = download_subscription(url)
+    if cfg is None:
+        die("Failed to download subscription (%s)" % via)
+
+    dest = os.path.join(PROFILES_DIR, slug + ".yaml")
+    os.replace(tmp, dest)
+    os.chmod(dest, 0o600)
+    meta["profiles"][slug] = {
+        "name": name, "file": "profiles/%s.yaml" % slug, "url": url,
+        "type": "remote", "updated": now_iso(),
+    }
+    save_meta(meta)
+
+    count = len(cfg.get("proxies") or [])
+    if not quiet:
+        print("Added subscription: %s (%s, %d nodes)" % (name, via, count))
+    if activate_it:
+        rebuild_active(slug, restart=restart)
+    return slug
+
+
+def cmd_add(args):
+    add_subscription(args.url, args.name, activate_it=True, restart=not args.no_start)
+
+
+def cmd_list(_args=None):
+    meta = ensure_base()
+    if not meta["profiles"]:
+        print("No profiles yet. Add one with: clash add <subscription-url>")
+        return
+    active = meta.get("active")
+    print("%-22s %-8s %-28s %s" % ("NAME", "TYPE", "SUBSCRIPTION", "UPDATED"))
+    print("-" * 86)
+    for slug, item in meta["profiles"].items():
+        mark = "*" if slug == active else " "
+        kind = "local" if item.get("type") == "local" else "remote"
+        print("%s %-20s %-8s %-28s %s" % (
+            mark, slug, kind, mask_url(item.get("url")), item.get("updated", "-")))
+
+
+def cmd_use(args):
+    meta = ensure_base()
+    slug = resolve_profile(meta, args.name)
+    if not slug:
+        die("Profile not found: %s (see: clash list)" % args.name)
+    rebuild_active(slug)
+
+
+def cmd_update(args):
+    meta = ensure_base()
+    slug = resolve_profile(meta, args.name)
+    if not slug:
+        die("No profile selected")
+    item = meta["profiles"][slug]
+    if item.get("type") != "remote" or not item.get("url"):
+        die("Local profile has no subscription URL and cannot be updated online")
+    cfg, tmp, via = download_subscription(item["url"])
+    if cfg is None:
+        die("Update failed (%s)" % via)
+    dest = os.path.join(BASE, item["file"])
+    os.replace(tmp, dest)
+    os.chmod(dest, 0o600)
+    item["updated"] = now_iso()
+    save_meta(meta)
+    print("Subscription updated: %s (%s)" % (item.get("name", slug), via))
+    if meta.get("active") == slug:
+        rebuild_active(slug)
+
+
+def _delay_of(proxies, name):
+    item = proxies.get(name) or {}
+    history = item.get("history") or []
+    if history:
+        delay = history[-1].get("delay", 0)
+        if delay and delay > 0:
+            return "%dms" % delay
+    return "-"
+
+
+def cmd_nodes(args):
+    try:
+        data = api_request("/proxies", timeout=6)
+    except Exception:
+        die("Cannot reach the controller. The proxy service may be down (clash start)")
+
+    proxies = data.get("proxies") or {}
+    groups = [(n, p) for n, p in proxies.items()
+              if n != "GLOBAL" and p.get("type") in ("Selector", "URLTest", "Fallback", "LoadBalance")]
+    if not groups:
+        print("No proxy groups found")
+        return
+
+    if args.test:
+        print("Testing node latency, please wait...")
+        for name, group in groups:
+            if group.get("type") == "Selector":
+                try:
+                    result = api_request(
+                        "/group/%s/delay?url=%s&timeout=5000" % (
+                            urllib.parse.quote(name, safe=""),
+                            urllib.parse.quote("http://www.gstatic.com/generate_204", safe=""),
+                        ),
+                        timeout=40,
+                    )
+                    print("Group %s latency:" % name)
+                    for node, delay in sorted(result.items(), key=lambda kv: kv[1] if isinstance(kv[1], int) else 99999):
+                        print("  %6s  %s" % (("%dms" % delay) if isinstance(delay, int) else delay, node))
+                except Exception as exc:
+                    print("Group %s test failed: %s" % (name, exc))
+
+    for idx, (name, group) in enumerate(groups):
+        print("\n[%d] %s (%s)  current: %s" % (idx, name, group.get("type"), group.get("now", "-")))
+        if group.get("type") == "Selector":
+            for i, node in enumerate(group.get("all") or []):
+                mark = "*" if node == group.get("now") else " "
+                print("   %s %2d) %-42s %s" % (mark, i + 1, node, _delay_of(proxies, node)))
+
+    if not sys.stdin.isatty():
+        return
+    selectors = [i for i, (_, g) in enumerate(groups) if g.get("type") == "Selector"]
+    print()
+    print("Tip: enter the group number (in brackets) first, then the node number.")
+    if selectors:
+        print("      Manually selectable groups: %s" % ", ".join(
+            "[%d] %s" % (i, groups[i][0]) for i in selectors))
+    raw = input("Group number (Enter to skip): ").strip()
+    if not raw:
+        return
+    digits = re.sub(r"\D", "", raw)
+    if not digits or not (0 <= int(digits) < len(groups)):
+        warn("Invalid group number. Available: %s" % ", ".join("[%d]" % i for i in range(len(groups))))
+        return
+    group_idx = int(digits)
+    group_name, group = groups[group_idx]
+    if group.get("type") != "Selector":
+        warn("[%d] %s is a %s group and cannot be set manually; choose a Selector group"
+             % (group_idx, group_name, group.get("type")))
+        return
+    names = group.get("all") or []
+    if not names:
+        warn("This group has no selectable nodes")
+        return
+    print("\nNodes in group [%d] %s:" % (group_idx, group_name))
+    for i, node in enumerate(names):
+        mark = "*" if node == group.get("now") else " "
+        print("   %s %2d) %-42s %s" % (mark, i + 1, node, _delay_of(proxies, node)))
+    raw = input("Node number [1-%d] (Enter to cancel): " % len(names)).strip()
+    if not raw:
+        return
+    digits = re.sub(r"\D", "", raw)
+    if not digits or not (1 <= int(digits) <= len(names)):
+        warn("Invalid node number. Range: 1-%d" % len(names))
+        return
+    node = names[int(digits) - 1]
+    try:
+        api_request("/proxies/%s" % urllib.parse.quote(group_name, safe=""),
+                    method="PUT", data={"name": node})
+        print("Switched %s -> %s" % (group_name, node))
+    except Exception as exc:
+        die("Switch failed: %s" % exc)
+
+
+def cmd_status(_args=None):
+    meta = ensure_base()
+    active = meta.get("active")
+    print("=" * 56)
+    if active and active in meta["profiles"]:
+        item = meta["profiles"][active]
+        print("Active profile: %s (%s)" % (item.get("name", active),
+                                    "local" if item.get("type") == "local" else "remote"))
+        if item.get("url"):
+            print("Subscription: %s" % mask_url(item["url"]))
+        print("Updated: %s" % item.get("updated", "-"))
+    else:
+        print("Active profile: none")
+    print("HTTP proxy: %s (127.0.0.1:%d)" % ("running (served by TUN)" if tun_active() else ("running" if http_active() else "not running"), MIXED_PORT))
+    if tun_installed():
+        print("TUN mode: %s" % ("running" if tun_active() else ("installed/not running" if tun_enabled() else "installed/disabled")))
+    else:
+        print("TUN mode: not installed")
+    print("Controller: http://127.0.0.1:%d/ui/" % CTRL_PORT)
+    print("-" * 56)
+    try:
+        proxies = api_request("/proxies", timeout=4).get("proxies") or {}
+        for name, item in proxies.items():
+            if name != "GLOBAL" and item.get("type") == "Selector":
+                print("Group %-16s current -> %s" % (name, item.get("now", "-")))
+    except Exception:
+        print("Controller: connection failed")
+    print("-" * 56)
+    print("gstatic via proxy: HTTP %s" % http_code("https://www.gstatic.com/generate_204", proxy=PROXY_URL))
+    if tun_active():
+        print("gstatic direct: HTTP %s" % http_code("https://www.gstatic.com/generate_204"))
+    print("=" * 56)
+
+
+def cmd_start(_args=None):
+    if tun_installed() and tun_enabled():
+        res = subprocess.run(["sudo", "systemctl", "start", "mihomo-tun"])
+        if res.returncode != 0:
+            die("Failed to start TUN service")
+        print("TUN global proxy started")
+        return
+    user_systemctl("enable", "--now", "mihomo")
+    print("HTTP proxy started")
+
+
+def cmd_stop(_args=None):
+    if tun_installed() and (tun_active() or tun_enabled()):
+        die("Use 'clash tun off' to stop TUN mode (this also restores system DNS)")
+    user_systemctl("stop", "mihomo")
+    print("HTTP proxy stopped")
+
+
+def cmd_restart(_args=None):
+    restart_proxy()
+    print("Service restarted")
+
+
+def cmd_logs(args):
+    if tun_installed() and (tun_active() or tun_enabled()):
+        cmd = ["journalctl", "-u", "mihomo-tun", "-n", "80"]
+        if os.geteuid() != 0:
+            cmd = ["sudo"] + cmd
+    else:
+        cmd = ["journalctl", "--user", "-u", "mihomo", "-n", "80"]
+    if getattr(args, "follow", False):
+        cmd.append("-f")
+    else:
+        cmd.append("--no-pager")
+    subprocess.run(cmd)
+
+
+def _write_tun_from_active():
+    meta = ensure_base()
+    active = meta.get("active")
+    if not active:
+        die("No profile selected")
+    item = meta["profiles"][active]
+    raw = parse_clash_yaml(os.path.join(BASE, item["file"]))
+    if raw is None:
+        die("Cannot parse the active profile")
+    cfg = build_runtime(raw, "tun")
+    tmp = dump_config(cfg, RUNTIME_TUN)
+    ok, log = validate_config(tmp)
+    if not ok:
+        os.unlink(tmp)
+        die("TUN config validation failed:\n%s" % log[-1500:])
+    replace_config(tmp, RUNTIME_TUN)
+    print("Generated TUN config from profile %s" % item.get("name", active))
+
+
+def cmd_tun(args):
+    action = args.action
+    if action == "status":
+        print("TUN service: %s" % ("running" if tun_active() else ("installed" if tun_installed() else "not installed")))
+        return
+    if action == "on":
+        _write_tun_from_active()
+        install = os.path.join(BASE, "install-tun.sh")
+        if not os.path.exists(install):
+            die("Missing installer: %s" % install)
+        res = subprocess.run(["sudo", "bash", install])
+        if res.returncode != 0:
+            die("TUN install/start failed; rolled back automatically")
+        return
+    if action == "off":
+        rollback = os.path.join(BASE, "rollback-tun.sh")
+        if not os.path.exists(rollback):
+            die("Rollback script not found; was TUN mode installed?")
+        res = subprocess.run(["sudo", "bash", rollback])
+        if res.returncode != 0:
+            die("Failed to stop TUN mode")
+        return
+    die("Unknown action: %s" % action)
+
+
+def cmd_remove(args):
+    meta = ensure_base()
+    slug = resolve_profile(meta, args.name)
+    if not slug:
+        die("Profile not found: %s" % args.name)
+    if meta.get("active") == slug:
+        die("Cannot remove the active profile; switch to another profile first")
+    item = meta["profiles"][slug]
+    path = os.path.join(BASE, item["file"])
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+    del meta["profiles"][slug]
+    save_meta(meta)
+    print("Removed profile: %s" % item.get("name", slug))
+
+
+def cmd_import_verge(args):
+    meta = ensure_base()
+    if not os.path.exists(VERGE_PROFILES):
+        die("Clash Verge profiles.yaml not found")
+    try:
+        data = yaml.safe_load(open(VERGE_PROFILES, "r", encoding="utf-8"))
+    except Exception as exc:
+        die("Failed to read Clash Verge config: %s" % exc)
+
+    imported = []
+    for item in data.get("items") or []:
+        if item.get("type") != "remote" or not item.get("url"):
+            continue
+        name = item.get("name") or item.get("uid") or "subscription"
+        slug = re.sub(r"[^\w\u4e00-\u9fff-]+", "-", name, flags=re.UNICODE).strip("-").lower()
+        if slug in meta["profiles"]:
+            print("Skipped (already exists): %s" % name)
+            continue
+        try:
+            got = add_subscription(item["url"], name, activate_it=False,
+                                   overwrite=False, quiet=True)
+            imported.append(got)
+            print("Imported: %s" % name)
+        except SystemExit:
+            print("Import failed: %s (skipped)" % name)
+        except Exception as exc:
+            print("Import failed: %s (%s)" % (name, exc))
+
+    if args.use:
+        target = resolve_profile(load_meta(), args.use)
+        if target:
+            rebuild_active(target)
+        else:
+            warn("Profile to activate not found: %s" % args.use)
+    elif not imported:
+        print("No new subscriptions to import")
+
+
+# ---------------------------------------------------------------- Interactive menu
+def _menu_header():
+    meta = ensure_base()
+    active = meta.get("active")
+    name = "-"
+    if active and active in meta["profiles"]:
+        name = meta["profiles"][active].get("name", active)
+    mode = "not running"
+    if tun_active():
+        mode = "TUN global mode"
+    elif http_active():
+        mode = "HTTP proxy mode"
+    print()
+    print("=" * 56)
+    print("  Clash Server - Subscription Manager")
+    print("=" * 56)
+    print("  Active profile: %s    Service: %s" % (name, mode))
+    print("-" * 56)
+    print("  1) Add subscription      2) Update active subscription")
+    print("  3) List/switch profiles  4) View/select nodes")
+    print("  5) Start/restart service 6) Stop service")
+    print("  7) Status/connectivity   8) TUN global mode")
+    print("  9) Import from Clash Verge")
+    print("  0) Exit")
+    print("=" * 56)
+
+
+def interactive_menu():
+    while True:
+        _menu_header()
+        try:
+            choice = input("Select [0-9]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        try:
+            if choice == "0":
+                return
+            elif choice == "1":
+                url = input("Subscription URL: ").strip()
+                if url:
+                    add_subscription(url)
+            elif choice == "2":
+                cmd_update(argparse.Namespace(name=None))
+            elif choice == "3":
+                cmd_list()
+                target = input("Profile name/slug to switch to (Enter to cancel): ").strip()
+                if target:
+                    cmd_use(argparse.Namespace(name=target))
+            elif choice == "4":
+                cmd_nodes(argparse.Namespace(test=False))
+            elif choice == "5":
+                cmd_restart()
+            elif choice == "6":
+                cmd_stop()
+            elif choice == "7":
+                cmd_status()
+            elif choice == "8":
+                print("  1) Enable TUN global mode  2) Disable (restore HTTP proxy)  3) Status")
+                sub = input("Select: ").strip()
+                if sub == "1":
+                    cmd_tun(argparse.Namespace(action="on"))
+                elif sub == "2":
+                    cmd_tun(argparse.Namespace(action="off"))
+                elif sub == "3":
+                    cmd_tun(argparse.Namespace(action="status"))
+            elif choice == "9":
+                cmd_import_verge(argparse.Namespace(use=None))
+            else:
+                warn("Invalid selection")
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                print("Operation did not complete; returning to menu.")
+        except Exception as exc:
+            print("Operation failed: %s" % exc)
+
+
+# ---------------------------------------------------------------- Entry point
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="clash",
+        description="Clash (mihomo) subscription manager for headless servers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    p_add = sub.add_parser("add", help="Add a subscription and enable it")
+    p_add.add_argument("url", nargs="?", help="Subscription URL")
+    p_add.add_argument("--name", help="Profile name")
+    p_add.add_argument("--no-start", action="store_true", help="Add without restarting the service")
+    p_add.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list", help="List profiles")
+    p_list.set_defaults(func=cmd_list)
+
+    p_use = sub.add_parser("use", help="Switch profile")
+    p_use.add_argument("name")
+    p_use.set_defaults(func=cmd_use)
+
+    p_update = sub.add_parser("update", help="Update subscription")
+    p_update.add_argument("name", nargs="?")
+    p_update.set_defaults(func=cmd_update)
+
+    p_nodes = sub.add_parser("nodes", help="View/select nodes")
+    p_nodes.add_argument("--test", action="store_true", help="Test node latency")
+    p_nodes.set_defaults(func=cmd_nodes)
+
+    p_status = sub.add_parser("status", help="Show status")
+    p_status.set_defaults(func=cmd_status)
+
+    p_start = sub.add_parser("start", help="Start service")
+    p_start.set_defaults(func=cmd_start)
+    p_stop = sub.add_parser("stop", help="Stop service")
+    p_stop.set_defaults(func=cmd_stop)
+    p_restart = sub.add_parser("restart", help="Restart service")
+    p_restart.set_defaults(func=cmd_restart)
+
+    p_logs = sub.add_parser("logs", help="Show logs")
+    p_logs.add_argument("-f", "--follow", action="store_true")
+    p_logs.set_defaults(func=cmd_logs)
+
+    p_tun = sub.add_parser("tun", help="System-wide TUN mode")
+    p_tun.add_argument("action", choices=("on", "off", "status"))
+    p_tun.set_defaults(func=cmd_tun)
+
+    p_remove = sub.add_parser("remove", help="Remove profile")
+    p_remove.add_argument("name")
+    p_remove.set_defaults(func=cmd_remove)
+
+    p_import = sub.add_parser("import-verge", help="Import subscriptions from Clash Verge")
+    p_import.add_argument("--use", help="Activate the given profile after import")
+    p_import.set_defaults(func=cmd_import_verge)
+
+    p_menu = sub.add_parser("menu", help="Interactive menu")
+    p_menu.set_defaults(func=lambda _a: interactive_menu())
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "command", None):
+        interactive_menu()
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
